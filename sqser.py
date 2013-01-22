@@ -232,7 +232,7 @@ if __name__ == '__main__':
     log.info("Sending data to sqs")
     start = time.time()
     data_queue = Queue()
-    send_threads = [gevent.spawn(queue_execute, data_queue, sqs_write, sqs_queue, s3_bucket) for _ in range(100)]
+    send_threads = [gevent.spawn(queue_execute, data_queue, sqs_write, sqs_queue, s3_bucket) for _ in range(500)]
     for data in datas:
         data_queue.put(data)
     gevent.joinall(send_threads)
@@ -275,7 +275,7 @@ if __name__ == '__main__':
 
     # Many to delete sqs seeing as that has to happen one at a time
     # Only one for s3, as that gets bulked up
-    delete_threads = [gevent.spawn(sqs_deleter, sqs_delete_queue) for _ in range(10)]
+    delete_threads = [gevent.spawn(sqs_deleter, sqs_delete_queue) for _ in range(500)]
     gevent.spawn(s3_deleter, s3_delete_queue, s3_bucket)
     time.sleep(0.01)
 
@@ -287,7 +287,7 @@ if __name__ == '__main__':
     end = 0
     start = time.time()
     into = Queue()
-    read_threads = [gevent.spawn(sqs_poll, sqs_queue, s3_bucket, into) for i in range(100)]
+    read_threads = [gevent.spawn(sqs_poll, sqs_queue, s3_bucket, into) for i in range(500)]
     time.sleep(0.01)
 
     # Receive everything from the Queue we created
