@@ -11,7 +11,7 @@ monkey.patch_all()
 from boto.exception import S3ResponseError
 from boto.sqs.message import RawMessage
 from collections import namedtuple
-from Queue import Queue, Empty
+from gevent.pool import Pool
 from boto.s3.key import Key
 import argparse
 import random
@@ -31,22 +31,16 @@ log = logging.getLogger("sqsplay")
 Payload = namedtuple('Payload', ['payload', 'sqs_result', 's3_key', 'successful', 'discard'])
 """Holds result from sqs, s3 key; and the payload data itself"""
 
-def queue_execute(data_queue, func, *args):
-    """Keep reading from a queue and execute func with each thing that comes through"""
-    while True:
-        try:
-            data = data_queue.get(block=False)
-        except Empty:
-            return
-
-        func(data, *args)
-
 class NoKey(Exception):
     """For when an sqs message references an s3 key that don't exist"""
     pass
 
 class BadKey(Exception):
     """For when we can't read an s3 key for some non 404 reason"""
+    pass
+
+class NoArg(object):
+    """Default for an argument that is optional"""
     pass
 
 ########################
@@ -58,24 +52,27 @@ def sqs_write(data, sqs_queue, bucket):
         Write a message to an sqs queue
         If the message is too big for the queue, then write to an s3 bucket instead
     """
+    key = ''
+    where = 'sqs'
+
     m = RawMessage()
     message = {'what':3, 'message':base64.b64encode(data)}
     body = json.dumps(message)
     if len(body) >= 65536:
         key = s3_write(bucket, body)
         body = json.dumps({'s3':key})
-        log.info('Adding s3 %s', key)
-    else:
-        log.info('Adding to sqs')
+        where = 's3 '
+
     m.set_body(body)
     sqs_queue.write(m)
+    log.info("Added to %s%s", where, key)
 
-def sqs_read(queue, bucket):
+def sqs_read(sqs_queue, bucket):
     """
         Read a message from sqs and json.loads the body
         If the body is a pointer to s3, then get from there and json.loads that
     """
-    results = queue.get_messages(num_messages=10)
+    results = sqs_queue.get_messages(num_messages=10)
     if results:
         log.info('Got %s', len(results))
 
@@ -97,14 +94,6 @@ def sqs_read(queue, bucket):
                 discard, successful, payload = safe_s3_read(bucket, s3_key)
 
         yield Payload(payload, sqs_result, s3_key, successful, discard)
-
-def sqs_poll(queue, bucket, into):
-    """Poll from sqs and put the results into the provided queue"""
-    while True:
-        for result in sqs_read(queue, bucket):
-            into.put(result)
-        else:
-            time.sleep(2)
 
 ########################
 ###   S3
@@ -169,6 +158,74 @@ def s3_delete_all(bucket):
     bucket.delete_keys(keys)
 
 ########################
+###   POOLS
+########################
+
+class SingleItemPool(object):
+    """Pool that spawns the action for each item that comes through"""
+    def __init__(self, limit, action, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.action = action
+        self.joining = False
+        self.pool = Pool(limit)
+
+    def add_handler(self, item=NoArg):
+        """
+            Spawn the action with the provided item
+            Also use the args and kwargs from __init__
+            And don't pass in the item if it wasn't specified
+        """
+        if item is NoArg:
+            self.pool.spawn(self.action, *self.args, **self.kwargs)
+        else:
+            self.pool.spawn(self.action, item, *self.args, **self.kwargs)
+
+    def add_handlers(self, number, item=NoArg):
+        """Add many handlers"""
+        for i in range(number):
+            self.add_handler(item)
+
+    def join(self):
+        """Wait for the spawned greenlets to finish"""
+        self.joining = True
+        self.pool.join()
+        self.joining = False
+
+    def process(self, items, join=True):
+        """Add handlers for some items and optionally join"""
+        for item in items:
+            self.add_handler(item)
+
+        if join:
+            self.join()
+
+class BulkItemsPool(SingleItemPool):
+    """Pool that only spawns the action for self.every items"""
+    def __init__(self, limit, every, action, *args, **kwargs):
+        self.buf = []
+        self.every = every
+        super(BulkItemsPool, self).__init__(limit, action, *args, **kwargs)
+
+    def add_handler(self, item):
+        """We create a buffer of items and only spawn when we have greater than self.every of them"""
+        self.buf.append(item)
+        if len(self.buf) > self.every:
+            self.spawn()
+
+    def join(self):
+        """Make sure we clear out any existing self.buf items before joining"""
+        if self.buf:
+            self.spawn()
+        super(BulkItemsPool, self).join()
+
+    def spawn(self):
+        """Spawn an action for everything in self.buf and clear self.buf"""
+        items = [item for item in self.buf]
+        self.buf = []
+        super(BulkItemsPool, self).add_handler(items)
+
+########################
 ###   APPLICATION
 ########################
 
@@ -204,6 +261,9 @@ if __name__ == '__main__':
     ###   SETUP
     ########################
 
+    # Some counts
+    counts = dict(s3_deleted_count = 0, sqs_deleted_count = 0, processed = 0, received = 0)
+
     # Get me some credentials
     credentials = yaml.load(open("credentials.yaml"))
     key_id = credentials['auth']['key_id']
@@ -231,74 +291,40 @@ if __name__ == '__main__':
 
     log.info("Sending data to sqs")
     start = time.time()
-    data_queue = Queue()
-    send_threads = [gevent.spawn(queue_execute, data_queue, sqs_write, sqs_queue, s3_bucket) for _ in range(500)]
-    for data in datas:
-        data_queue.put(data)
-    gevent.joinall(send_threads)
+    write_pool = SingleItemPool(100, sqs_write, sqs_queue, s3_bucket)
+    write_pool.process(datas)
     log.info("sending %s things took %.2f seconds", len(datas), time.time() - start)
 
     ########################
     ###   DELETION
     ########################
 
-    # Setup threads to delete messages when we are finished with them
-    s3_delete_queue = Queue()
-    sqs_delete_queue = Queue()
-    info = {'finished' : False}
+    # Setup pools to delete messages when we are finished with them
 
-    def s3_deleter(queue, bucket, group_count=20):
-        """Try to group up deleting s3 keys"""
-        buf = []
-        while True:
-            try:
-                buf.append(queue.get(timeout=1))
-                if len(buf) > group_count:
-                    bucket.delete_keys(buf)
-                    buf = []
-            except Empty:
-                if info['finished']:
-                    break
+    def s3_delete(keys, bucket):
+        """Processor to delete s3 keys"""
+        counts['s3_deleted_count'] += len(keys)
+        log.info("Deleting %d s3 keys", len(keys))
+        bucket.delete_keys(keys)
+    s3_deleter = BulkItemsPool(100, 10, s3_delete, s3_bucket)
 
-        # Make sure to remove the leftovers
-        if buf:
-            bucket.delete_keys(buf)
-
-    def sqs_deleter(queue):
-        """Delete each sqs result as it comes in"""
-        while True:
-            try:
-                queue.get(timeout=1).delete()
-            except Empty:
-                if info['finished']:
-                    break
-
-    # Many to delete sqs seeing as that has to happen one at a time
-    # Only one for s3, as that gets bulked up
-    delete_threads = [gevent.spawn(sqs_deleter, sqs_delete_queue) for _ in range(500)]
-    gevent.spawn(s3_deleter, s3_delete_queue, s3_bucket)
-    time.sleep(0.01)
+    def sqs_delete(item):
+        """Processor to delete sqs items"""
+        counts['sqs_deleted_count'] += 1
+        log.info("Deleting sqs item")
+        item.delete()
+    sqs_deleter = SingleItemPool(500, sqs_delete)
 
     ########################
     ###   RETRIEVAL
     ########################
 
     log.info("Reading data from sqs")
-    end = 0
+    times = dict(end = 0)
     start = time.time()
-    into = Queue()
-    read_threads = [gevent.spawn(sqs_poll, sqs_queue, s3_bucket, into) for i in range(500)]
-    time.sleep(0.01)
 
-    # Receive everything from the Queue we created
-    count = 0
-    while True:
-        try:
-            end = time.time()
-            retrieved = into.get(timeout=5)
-        except Empty:
-            break
-
+    def retrieve(retrieved):
+        """Deal with something we got from the sqs queue"""
         if retrieved.successful:
             if 'message' in retrieved.payload:
                 decoded = base64.b64decode(retrieved.payload['message'])
@@ -308,18 +334,54 @@ if __name__ == '__main__':
 
         if retrieved.successful or retrieved.discard:
             # Putting sqs result ans s3 keys into queues for deletion
-            sqs_delete_queue.put(retrieved.sqs_result)
+            sqs_deleter.add_handler(retrieved.sqs_result)
             if retrieved.s3_key:
-                s3_delete_queue.put(retrieved.s3_key)
-            count += 1
+                s3_deleter.add_handler(retrieved.s3_key)
+
+        # Record when we processed the last thing
+        times['end'] = time.time()
+        counts['processed'] += 1
+
+    def reader(queue, bucket, dealer):
+        """Read from sqs and pass onto our dealer"""
+        results = list(sqs_read(queue, bucket))
+        counts['received'] += len(results)
+        for result in results:
+            dealer.add_handler(result)
+
+    # Pools for reading data and dealing with that data
+    deal_pool = SingleItemPool(500, retrieve)
+    read_pool = SingleItemPool(500, reader, sqs_queue, s3_bucket, deal_pool)
+
+    # Naive attempt at determining when we have stopped
+    same = False
+    last_received = counts['received']
+    while True:
+        read_pool.add_handlers(20)
+
+        time.sleep(0.5)
+        now_same = counts['received'] == last_received
+        if same and now_same:
+            read_pool.join()
+            deal_pool.join()
+            break
+        elif now_same:
+            same = True
+            time.sleep(2)
+            continue
+        else:
+            same = False
+
+        last_received = counts['received']
 
     ########################
     ###   CLEANUP
     ########################
 
-    log.info("Getting %d things took %.2f seconds", count, end - start)
-    gevent.killall(read_threads)
+    log.info("Getting %d things took %.2f seconds", counts['processed'], times['end'] - start)
 
     log.info("Making sure the sqs and s3 things are deleted")
-    info['finished'] = True
-    gevent.joinall(delete_threads)
+    s3_deleter.join()
+    sqs_deleter.join()
+
+    log.info("Deleted %d s3 keys, %d sqs items", counts['s3_deleted_count'], counts['sqs_deleted_count'])
