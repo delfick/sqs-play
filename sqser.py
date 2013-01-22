@@ -80,13 +80,21 @@ def sqs_read(queue, bucket):
         log.info('Got %s', len(results))
 
     for index, sqs_result in enumerate(results):
+        s3_key = None
+        payload = None
         discard = False
         successful = True
 
-        payload = json.loads(sqs_result.get_body())
-        s3_key = payload.get('s3')
-        if s3_key:
-            discard, successful, payload = safe_s3_read(bucket, s3_key)
+        try:
+            payload = json.loads(sqs_result.get_body())
+        except ValueError:
+            discard = True
+            successful = False
+
+        if successful:
+            s3_key = payload.get('s3')
+            if s3_key:
+                discard, successful, payload = safe_s3_read(bucket, s3_key)
 
         yield Payload(payload, sqs_result, s3_key, successful, discard)
 
